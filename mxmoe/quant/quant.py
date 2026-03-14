@@ -7,6 +7,7 @@ import argparse
 import warnings
 import torch.nn as nn
 import torch.nn.functional as F
+import inspect
 
 from copy import deepcopy
 from enum import StrEnum
@@ -120,6 +121,7 @@ class QMethod(StrEnum):
     # WxA16
     GPTQ = "gptq"
     AWQ = "awq"
+    HQQ = "hqq"
     WxA16_NAIVE = "wxa16_naive"
 
 
@@ -131,6 +133,87 @@ def mlp_inp_quant_hook(m: nn.Module, inp, quantizer: Quantizer):
 
 def smooth_act_quant_hook(m: nn.Module, inp:tuple, quantizer: Quantizer, smooth_scale: Tensor):
     return quantizer.fake_quant(inp[0].div(smooth_scale))
+
+
+def _set_module_by_name(root: nn.Module, module_name: str, new_module: nn.Module):
+    parent_name, _, child_name = module_name.rpartition(".")
+    parent = root.get_submodule(parent_name) if parent_name else root
+    setattr(parent, child_name, new_module)
+
+
+def _build_hqq_quant_config(cfg: QLinearConfig):
+    try:
+        from hqq.core.quantize import BaseQuantizeConfig
+    except ImportError as exc:
+        raise ImportError(
+            "HQQ quantization requires the optional `hqq` package. Install it before using `--method hqq`."
+        ) from exc
+
+    quant_kwargs = {
+        "nbits": cfg.w_bits,
+        "group_size": None if cfg.w_gsize == -1 else cfg.w_gsize,
+        "axis": 1,
+        "view_as_float": False,
+    }
+    sig = inspect.signature(BaseQuantizeConfig)
+    if "quant_zero" in sig.parameters:
+        quant_kwargs["quant_zero"] = not cfg.w_sym
+    if "quant_scale" in sig.parameters:
+        quant_kwargs["quant_scale"] = True
+    if "offload_meta" in sig.parameters:
+        quant_kwargs["offload_meta"] = False
+    if "round_zero" in sig.parameters:
+        quant_kwargs["round_zero"] = False
+
+    supported_kwargs = {
+        key: value for key, value in quant_kwargs.items()
+        if key in sig.parameters
+    }
+    return BaseQuantizeConfig(**supported_kwargs)
+
+
+def _quantize_linear_with_hqq(linear: nn.Linear, cfg: QLinearConfig) -> nn.Module:
+    try:
+        from hqq.core.quantize import HQQLinear
+    except ImportError as exc:
+        raise ImportError(
+            "HQQ quantization requires the optional `hqq` package. Install it before using `--method hqq`."
+        ) from exc
+
+    quant_config = _build_hqq_quant_config(cfg)
+    from_linear = getattr(HQQLinear, "from_linear", None)
+    if from_linear is None:
+        raise AttributeError("The installed `hqq` package does not expose `HQQLinear.from_linear`.")
+
+    kwargs = {}
+    sig = inspect.signature(from_linear)
+    if "linear_layer" in sig.parameters:
+        kwargs["linear_layer"] = linear
+    elif "module" in sig.parameters:
+        kwargs["module"] = linear
+    elif "layer" in sig.parameters:
+        kwargs["layer"] = linear
+    else:
+        kwargs[next(iter(sig.parameters))] = linear
+
+    if "quant_config" in sig.parameters:
+        kwargs["quant_config"] = quant_config
+    elif "config" in sig.parameters:
+        kwargs["config"] = quant_config
+
+    if "compute_dtype" in sig.parameters:
+        kwargs["compute_dtype"] = linear.weight.dtype
+    if "device" in sig.parameters:
+        kwargs["device"] = linear.weight.device
+    if "initialize" in sig.parameters:
+        kwargs["initialize"] = True
+    if "del_orig" in sig.parameters:
+        kwargs["del_orig"] = False
+
+    quantized_linear = from_linear(**kwargs)
+    if hasattr(quantized_linear, "requires_grad_"):
+        quantized_linear.requires_grad_(False)
+    return quantized_linear
 
 @torch.no_grad()
 def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
@@ -361,7 +444,7 @@ class MoeModelQuantizer:
 
     @torch.no_grad()
     def preprocess_weight(self, model: PreTrainedModel, layer_idx: int, exp_idx: int=-1):
-        if self.qmethod in [QMethod.WxA16_NAIVE, QMethod.WxAy_NAIVE, QMethod.GPTQ, QMethod.GPTQ_HAD, QMethod.RTN_HAD]:
+        if self.qmethod in [QMethod.WxA16_NAIVE, QMethod.WxAy_NAIVE, QMethod.GPTQ, QMethod.GPTQ_HAD, QMethod.RTN_HAD, QMethod.HQQ]:
             return
 
         for layer_i in range(self.num_layers):
@@ -432,6 +515,15 @@ class MoeModelQuantizer:
                 for linear_block, m in weights_in_expert.items():
                     cfg = qmap[linear_block]
                     if cfg.w_bits >= 16: continue
+                    if self.qmethod == QMethod.HQQ:
+                        assert cfg.a_bits >= 16, "HQQ is currently integrated as weight-only quantization"
+                        for child_name, child in expert.named_modules():
+                            if child is not m:
+                                continue
+                            quantized_linear = _quantize_linear_with_hqq(m, cfg)
+                            _set_module_by_name(expert, child_name, quantized_linear)
+                            break
+                        continue
                     # GPTQ
                     if self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]:
                         print(f"Quantizing layer-{layer_i} expert-{expert_idx} block-{linear_block} with GPTQ ...")
@@ -494,6 +586,8 @@ class MoeModelQuantizer:
                         )
                     elif self.qmethod in [QMethod.WxAy_NAIVE, QMethod.GPTQ, QMethod.GPTQ_HAD, QMethod.RTN_HAD]:
                         act_quant_hook = partial(mlp_inp_quant_hook, quantizer=quantizer)
+                    elif self.qmethod == QMethod.HQQ:
+                        raise NotImplementedError("HQQ is currently integrated as weight-only quantization")
                     elif self.qmethod == QMethod.LLM_INT8:
                         raise NotImplementedError("")
                     else:
@@ -709,7 +803,7 @@ if __name__ == "__main__":
 
     parser_eval = subparsers.add_parser("eval", help="Eval quantized model")
     parser_eval.add_argument("--model", type=str, default="qwen2_moe", help="Model ID")
-    parser_eval.add_argument("--method", type=str, default="rtn", choices=["rtn", "smooth", "gptq", "gptq-had", "rtn-had"], help="Quantization method")
+    parser_eval.add_argument("--method", type=str, default="rtn", choices=["rtn", "smooth", "gptq", "gptq-had", "rtn-had", "hqq"], help="Quantization method")
     parser_eval.add_argument("--qweight", type=str, help="Load the quantized weight from file")
     parser_eval.add_argument("--seed", type=int, default=42, help="Random Seed.")
     parser_eval.add_argument("--qconfig", type=str, help="Quantization config file")
@@ -721,7 +815,7 @@ if __name__ == "__main__":
 
     parser_calib = subparsers.add_parser("calib", help="Calibrate for quantized model")
     parser_calib.add_argument("--model", type=str, default="ds2", help="Model ID")
-    parser_calib.add_argument("--method", type=str, default="rtn", choices=["rtn", "smooth", "gptq", "gptq-had", "rtn-had"], help="Quantization method")
+    parser_calib.add_argument("--method", type=str, default="rtn", choices=["rtn", "smooth", "gptq", "gptq-had", "rtn-had", "hqq"], help="Quantization method")
     parser_calib.add_argument("--qcfg", type=str, required=True, help="Quantization config str")
     parser_calib.add_argument("--metric", type=str, choices=["fisher", "model_out_norm", "layer_out_norm"], help="Evaluation metric")
     parser_calib.add_argument("--qweight", type=str, default=None, help="Load the quantized weight from file")
@@ -762,6 +856,7 @@ if __name__ == "__main__":
         "gptq": QMethod.GPTQ,
         "gptq-had": QMethod.GPTQ_HAD,
         "rtn-had": QMethod.RTN_HAD,
+        "hqq": QMethod.HQQ,
     }
     qmethod = qtype_2_method[quant_type]
 
@@ -934,6 +1029,10 @@ if __name__ == "__main__":
             pre_quantized_weight = args.qweight
             model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ_HAD, pre_quantized_weight=pre_quantized_weight, online_had=args.online_had)
             save_path = f"{CUR_DIR}/calib/{model_id}-MOE-gptq-had-{uni_qconfig}-{'wiki2'}-{nsamples}-{seqlen}-{metric}.json"
+        elif quant_type == "hqq":
+            assert uni_qconfig.a_bits == 16, "HQQ is currently integrated as weight-only quantization"
+            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.HQQ)
+            save_path = f"{CUR_DIR}/calib/{model_id}-MOE-hqq-{uni_qconfig}-{'wiki2'}-{nsamples}-{seqlen}-{metric}.json"
         elif quant_type == "smooth":
             raise NotImplementedError("")
         else:
