@@ -181,36 +181,37 @@ def _quantize_linear_with_hqq(linear: nn.Linear, cfg: QLinearConfig) -> nn.Modul
         ) from exc
 
     quant_config = _build_hqq_quant_config(cfg)
-    from_linear = getattr(HQQLinear, "from_linear", None)
-    if from_linear is None:
-        raise AttributeError("The installed `hqq` package does not expose `HQQLinear.from_linear`.")
-
+    init_sig = inspect.signature(HQQLinear.__init__)
     kwargs = {}
-    sig = inspect.signature(from_linear)
-    if "linear_layer" in sig.parameters:
-        kwargs["linear_layer"] = linear
-    elif "module" in sig.parameters:
-        kwargs["module"] = linear
-    elif "layer" in sig.parameters:
-        kwargs["layer"] = linear
-    else:
-        kwargs[next(iter(sig.parameters))] = linear
 
-    if "quant_config" in sig.parameters:
+    first_arg_names = ("linear_layer", "module", "layer")
+    for arg_name in first_arg_names:
+        if arg_name in init_sig.parameters:
+            kwargs[arg_name] = linear
+            break
+    else:
+        positional_params = [
+            name for name, param in init_sig.parameters.items()
+            if name != "self" and param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if positional_params:
+            kwargs[positional_params[0]] = linear
+
+    if "quant_config" in init_sig.parameters:
         kwargs["quant_config"] = quant_config
-    elif "config" in sig.parameters:
+    elif "config" in init_sig.parameters:
         kwargs["config"] = quant_config
 
-    if "compute_dtype" in sig.parameters:
+    if "compute_dtype" in init_sig.parameters:
         kwargs["compute_dtype"] = linear.weight.dtype
-    if "device" in sig.parameters:
+    if "device" in init_sig.parameters:
         kwargs["device"] = linear.weight.device
-    if "initialize" in sig.parameters:
+    if "initialize" in init_sig.parameters:
         kwargs["initialize"] = True
-    if "del_orig" in sig.parameters:
+    if "del_orig" in init_sig.parameters:
         kwargs["del_orig"] = False
 
-    quantized_linear = from_linear(**kwargs)
+    quantized_linear = HQQLinear(**kwargs)
     if hasattr(quantized_linear, "requires_grad_"):
         quantized_linear.requires_grad_(False)
     return quantized_linear
